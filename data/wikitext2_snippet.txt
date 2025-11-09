@@ -1,0 +1,27 @@
+This is a small placeholder corpus for perplexity evaluation.
+It contains a few paragraphs of generic English text so that
+language model likelihood can be measured in a stable way.
+
+Large language models are typically evaluated on next-token
+prediction tasks. Perplexity is the exponential of the average
+negative log-likelihood, and lower values indicate better fit.
+
+In this project we study bias–perplexity trade-offs. We compare
+the remaining bias after local circuit edits with the change in
+perplexity measured on a held-out text. The goal is to minimize
+both remaining bias and performance cost, moving points closer
+to the lower-left corner of the Pareto plane.
+
+The text below is intentionally simple and neutral. You can replace
+this file with a longer corpus (e.g., a WikiText-2 excerpt) for
+more stable measurements.
+
+The method applies small interventions to internal features and
+connections. It then measures the effect on a fixed bias metric
+and on language modeling performance. When the intervention is
+more targeted, the reduction in bias can be achieved with a smaller
+increase in perplexity. This suggests that local edits can be
+preferable to coarse head ablations in practical settings.
+
+Replace this file with your preferred evaluation text if needed.*** End Patch*** }```>>
+
