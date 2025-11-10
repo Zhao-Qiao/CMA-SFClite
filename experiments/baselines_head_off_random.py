@@ -23,10 +23,7 @@ from sae_lens import SAE
 from transformer_lens import HookedTransformer
 from tqdm import tqdm
 
-try:
-    from prompt_sets import get_prompt_examples
-except ModuleNotFoundError:
-    from experiments.prompt_sets import get_prompt_examples
+from experiments.prompts_winogender import get_prompt_examples
 
 
 # ============================================================================
