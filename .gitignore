@@ -3,7 +3,7 @@
 # 结果文件目录（包含实验输出）
 results/
 *.json
-
+*.pt
 # Python 相关
 __pycache__/
 *.py[cod]

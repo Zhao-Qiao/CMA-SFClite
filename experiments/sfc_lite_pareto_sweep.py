@@ -41,8 +41,8 @@ except Exception:
     px = None
     go = None
 
-# Reuse core logic from sfc_lite_from_cma
-from sfc_lite_from_cma import (
+# Reuse core logic from the SFC-lite engine
+from .sfc_lite_engine import (
     load_model as load_tl_model,
     read_topk_heads,
     build_surgery,
@@ -52,7 +52,7 @@ from sfc_lite_from_cma import (
 )
 
 # CMA (per-head) to compute NIE matrix
-from cma_gender_bias import run_gender_bias_cma
+from .cma_gender_bias import run_gender_bias_cma
 
 
 def parse_args():
