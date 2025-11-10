@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import os
 from collections import namedtuple
 from dataclasses import dataclass
@@ -24,6 +23,11 @@ from sae_lens import SAE
 from transformer_lens import HookedTransformer
 from tqdm import tqdm
 
+try:
+    from prompt_sets import get_prompt_examples
+except ModuleNotFoundError:
+    from experiments.prompt_sets import get_prompt_examples
+
 
 # ============================================================================
 # Configuration
@@ -33,7 +37,7 @@ from tqdm import tqdm
 SAE_MODE = "attn"
 
 if SAE_MODE == "attn":
-    SAE_RELEASE = "gpt2-small-attn-out-v5-128k"
+    SAE_RELEASE = "gpt2-small-attn-out-v5-32k"
     SAE_HOOK_TEMPLATE = "blocks.{layer}.hook_attn_out"
 else:
     SAE_RELEASE = "gpt2-small-res-jb"
@@ -145,6 +149,58 @@ def find_mediator_submodule(
     if layer_idx < len(stash.resids):
         return stash.resids[layer_idx], "resid"
     return None, mediator_type
+
+
+def load_ranked_mediators_from_csv(csv_path: str, limit: Optional[int]) -> List[Dict]:
+    """Load ranked mediators (layer/head pairs) from a CMA results CSV."""
+
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Top-K 结果文件不存在: {csv_path}")
+
+    def _filtered_lines(path: str):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                yield line
+
+    filtered_iter = _filtered_lines(csv_path)
+    try:
+        header_line = next(filtered_iter)
+    except StopIteration:
+        raise ValueError(f"Top-K CSV ({csv_path}) 内没有有效内容")
+
+    header_raw = next(csv.reader([header_line]))
+    header = [col.strip() for col in header_raw]
+    required = {"rank", "layer", "head"}
+    missing = required - set(header)
+    if missing:
+        raise ValueError(f"Top-K CSV 缺少必要列: {', '.join(sorted(missing))}")
+
+    reader = csv.DictReader(filtered_iter, fieldnames=header)
+    mediators: List[Dict] = []
+    for row in reader:
+        if not row:
+            continue
+        row = {key: (value.strip() if isinstance(value, str) else value) for key, value in row.items()}
+        if row.get("rank") in (None, ""):
+            continue
+        mediator = {
+            "rank": int(row["rank"]),
+            "layer": int(row["layer"]),
+            "head": int(row["head"]),
+            "nie": float(row["nie"]) if row.get("nie") not in (None, "") else None,
+            "abs_nie": float(row["abs_nie"]) if row.get("abs_nie") not in (None, "") else None,
+            "type": "attn",
+        }
+        mediators.append(mediator)
+
+    if limit is not None and limit > 0:
+        mediators = mediators[:limit]
+    return mediators
+
+
 
 
 # ============================================================================
@@ -464,9 +520,9 @@ def apply_alpha_gate(
 
 def run_baselines(
     model_name: str,
-    mediator_path: str,
-    eval_data_path: str,
+    ranking_csv_path: str,
     output_path: str,
+    prompt_split: str,
     topk: int,
     control_count: int,
     num_features: int,
@@ -482,8 +538,8 @@ def run_baselines(
     print("NIE Baselines")
     print("=" * 70)
     print(f"模型: {model_name}")
-    print(f"Top-K Mediators 文件: {mediator_path}")
-    print(f"评估数据: {eval_data_path}")
+    print(f"Top-K Mediators CSV: {ranking_csv_path}")
+    print(f"评估 prompts split: {prompt_split}")
     print(f"SAE 模式: {SAE_MODE}")
     print(f"Top-K: {topk}, 控制数量: {control_count}")
     print("=" * 70)
@@ -501,23 +557,18 @@ def run_baselines(
 
     stash, dictionaries = load_saes_and_submodules(model, device=device)
 
-    with open(mediator_path, "r", encoding="utf-8") as f:
-        mediator_data = json.load(f)
-    mediators = mediator_data if isinstance(mediator_data, list) else mediator_data.get("mediators", [])
-
     total_needed = topk + control_count
-    mediators = mediators[:total_needed] if total_needed > 0 else mediators
+    mediators = load_ranked_mediators_from_csv(ranking_csv_path, total_needed if total_needed > 0 else None)
     mediators_main = mediators[:topk]
     mediators_control = mediators[topk:topk + control_count]
 
     mediator_entries = [(mediator, "topk") for mediator in mediators_main]
     mediator_entries.extend((mediator, "control") for mediator in mediators_control)
 
-    with open(eval_data_path, "r", encoding="utf-8") as f:
-        eval_data = json.load(f)
-    examples = eval_data.get("examples", eval_data if isinstance(eval_data, list) else [])
+    examples = get_prompt_examples(prompt_split)
     if not examples:
-        raise ValueError("评估数据为空")
+        raise ValueError(f"Prompt split '{prompt_split}' 没有可用样本")
+    has_examples = True
 
     rng = np.random.default_rng(seed)
     results: List[Dict] = []
@@ -595,17 +646,28 @@ def run_baselines(
                 ppl_edit_vals.append(ppl_base_gated)
                 nie_vals.append(nie_after - nie_orig)
 
-            if not bias_clean_vals:
+            if has_examples and not bias_clean_vals:
+                print(f"  ⚠ Mediator {idx} - {scenario['label']} 没有有效样本，跳过")
                 continue
 
-            mean_bias_clean = float(np.mean(bias_clean_vals))
-            mean_bias_edit = float(np.mean(bias_edit_vals))
-            mean_ppl_clean = float(np.mean(ppl_clean_vals))
-            mean_ppl_edit = float(np.mean(ppl_edit_vals))
-            mean_delta_nie = float(np.mean(nie_vals))
+            mean_bias_clean = float(np.mean(bias_clean_vals)) if bias_clean_vals else float("nan")
+            mean_bias_edit = float(np.mean(bias_edit_vals)) if bias_edit_vals else float("nan")
+            mean_ppl_clean = float(np.mean(ppl_clean_vals)) if ppl_clean_vals else float("nan")
+            mean_ppl_edit = float(np.mean(ppl_edit_vals)) if ppl_edit_vals else float("nan")
+            if nie_vals:
+                mean_delta_nie = float(np.mean(nie_vals))
+                nie_source = "evaluation"
+            else:
+                fallback_nie = mediator.get("nie")
+                mean_delta_nie = float(fallback_nie) if fallback_nie is not None else float("nan")
+                nie_source = "ranking_csv"
 
-            remaining_bias_pct = 1.0
-            if abs(mean_bias_clean) > 1e-9:
+            remaining_bias_pct = float("nan")
+            if (
+                not np.isnan(mean_bias_clean)
+                and abs(mean_bias_clean) > 1e-9
+                and not np.isnan(mean_bias_edit)
+            ):
                 remaining_bias_pct = float(abs(mean_bias_edit) / abs(mean_bias_clean))
 
             gated_corpus_ppl = float("nan")
@@ -620,6 +682,10 @@ def run_baselines(
                 if not np.isnan(baseline_corpus_ppl):
                     delta_corpus_ppl = gated_corpus_ppl - baseline_corpus_ppl
 
+            delta_prompt_ppl = float("nan")
+            if not np.isnan(mean_ppl_edit) and not np.isnan(mean_ppl_clean):
+                delta_prompt_ppl = mean_ppl_edit - mean_ppl_clean
+
             aggregate_row = {
                 "analysis": "baseline",
                 "edit_label": scenario["label"],
@@ -631,7 +697,7 @@ def run_baselines(
                 "bias_edited_mean": mean_bias_edit,
                 "ppl_original_mean": mean_ppl_clean,
                 "ppl_edited_mean": mean_ppl_edit,
-                "delta_ppl_mean": mean_ppl_edit - mean_ppl_clean,
+                "delta_ppl_mean": delta_prompt_ppl,
                 "remaining_bias_pct": remaining_bias_pct,
                 "delta_nie_mean": mean_delta_nie,
                 "corpus_ppl_original": baseline_corpus_ppl,
@@ -643,6 +709,7 @@ def run_baselines(
                 "mediator_nie": mediator.get("nie"),
                 "mediator_category": category,
                 "row_type": "aggregate",
+                "nie_source": nie_source,
             }
 
             results.append(aggregate_row)
@@ -660,34 +727,172 @@ def run_baselines(
 
 
 def plot_baseline_results(rows: List[Dict], csv_path: str) -> None:
-    aggregate_rows = [r for r in rows if "bias_edited_mean" in r]
+    aggregate_rows = [r for r in rows if r.get("row_type") == "aggregate"]
     if not aggregate_rows:
         return
-    remaining = [r.get("remaining_bias_pct", 1.0) * 100 for r in aggregate_rows]
-    delta_ppl = []
-    for r in aggregate_rows:
-        val = r.get("delta_corpus_ppl")
-        if val is None or np.isnan(val):
-            val = r.get("delta_ppl_mean", float("nan"))
-        delta_ppl.append(val)
-    labels = [r.get("edit_label", "edit") for r in aggregate_rows]
+    plot_bias_vs_ppl(aggregate_rows, csv_path)
+    plot_nie_vs_ppl(aggregate_rows, csv_path)
+
+
+FEATURE_SOURCE_MARKERS = {
+    "cma": "o",
+    "control": "s",
+    "random": "^",
+}
+
+
+def _select_delta_ppl(row: Dict) -> float:
+    val = row.get("delta_corpus_ppl")
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        val = row.get("delta_ppl_mean")
+    return val
+
+
+def build_bias_delta_pareto(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    sorted_points = sorted(points, key=lambda item: item[0])
+    frontier: List[Tuple[float, float]] = []
+    best_delta = float("inf")
+    for x_val, y_val in sorted_points:
+        if y_val < best_delta - 1e-9:
+            frontier.append((x_val, y_val))
+            best_delta = y_val
+    return frontier
+
+
+def plot_bias_vs_ppl(rows: List[Dict], csv_path: str) -> None:
+    from matplotlib.colors import Normalize
+
+    scatter_points = []
+    for row in rows:
+        bias_ratio = row.get("remaining_bias_pct")
+        delta = _select_delta_ppl(row)
+        if bias_ratio is None or delta is None:
+            continue
+        if isinstance(bias_ratio, float) and np.isnan(bias_ratio):
+            continue
+        if isinstance(delta, float) and np.isnan(delta):
+            continue
+        scatter_points.append((bias_ratio * 100.0, delta, row))
+
+    if not scatter_points:
+        return
+
+    costs = [point[2].get("sum_abs_edit", 0.0) for point in scatter_points]
+    cost_min, cost_max = (min(costs), max(costs)) if costs else (0.0, 0.0)
+    norm = Normalize(vmin=cost_min, vmax=cost_max) if cost_max - cost_min > 1e-6 else None
+    cmap = plt.get_cmap("plasma")
 
     plt.figure(figsize=(8, 5))
-    for x, y, lbl in zip(remaining, delta_ppl, labels):
-        plt.scatter(x, y, label=lbl, alpha=0.7)
+    scatter_handles = []
+    feature_sources = sorted({point[2].get("feature_source", "unknown") for point in scatter_points})
+    for source in feature_sources:
+        subset = [point for point in scatter_points if point[2].get("feature_source", "unknown") == source]
+        if not subset:
+            continue
+        xs = [point[0] for point in subset]
+        ys = [point[1] for point in subset]
+        colors = [point[2].get("sum_abs_edit", 0.0) for point in subset]
+        marker = FEATURE_SOURCE_MARKERS.get(source, "o")
+        scatter = plt.scatter(
+            xs,
+            ys,
+            c=colors,
+            cmap=cmap,
+            norm=norm,
+            marker=marker,
+            alpha=0.85,
+            edgecolors="none",
+            label=source,
+        )
+        scatter_handles.append(scatter)
+
+    if scatter_handles:
+        cbar = plt.colorbar(scatter_handles[0])
+        cbar.set_label("|1-α| × #features")
+
+    pareto_points = build_bias_delta_pareto([(point[0], point[1]) for point in scatter_points])
+    if pareto_points:
+        px, py = zip(*pareto_points)
+        plt.plot(px, py, color="black", linewidth=2, label="Pareto front")
+
     plt.xlabel("剩余偏差（% 基线）")
-    plt.ylabel("ΔPPL（语料）")
-    plt.title("Baseline Pareto (Bias vs ΔPPL)")
-    handles, unique_labels = [], []
-    for lbl in sorted(set(labels)):
-        handles.append(plt.Line2D([0], [0], marker="o", color="w", label=lbl, markerfacecolor="tab:blue", markersize=8))
+    plt.ylabel("ΔPPL")
+    plt.title("Bias–Perplexity Pareto")
+    handles, labels = plt.gca().get_legend_handles_labels()
     if handles:
-        plt.legend(handles, [h.get_label() for h in handles])
+        plt.legend(handles, labels)
     plt.grid(True, alpha=0.3)
-    plot_path = os.path.splitext(csv_path)[0] + ".png"
+    plot_path = os.path.splitext(csv_path)[0] + "_bias_pareto.png"
     plt.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"✓ 绘制基线图: {plot_path}")
+    print(f"✓ 绘制 Bias-Pareto 图: {plot_path}")
+
+
+def plot_nie_vs_ppl(rows: List[Dict], csv_path: str) -> None:
+    from matplotlib.colors import Normalize
+
+    scatter_points = []
+    for row in rows:
+        nie_delta = row.get("delta_nie_mean")
+        delta = _select_delta_ppl(row)
+        if nie_delta is None or delta is None:
+            continue
+        if isinstance(nie_delta, float) and np.isnan(nie_delta):
+            continue
+        if isinstance(delta, float) and np.isnan(delta):
+            continue
+        scatter_points.append((nie_delta, delta, row))
+
+    if not scatter_points:
+        return
+
+    layer_vals = [point[2].get("mediator_layer") for point in scatter_points if point[2].get("mediator_layer") is not None]
+    if layer_vals:
+        layer_min, layer_max = min(layer_vals), max(layer_vals)
+        layer_norm = Normalize(vmin=layer_min, vmax=layer_max if layer_max != layer_min else layer_min + 1)
+    else:
+        layer_norm = None
+    cmap = plt.get_cmap("viridis")
+
+    plt.figure(figsize=(8, 5))
+    color_ref = None
+    feature_sources = sorted({point[2].get("feature_source", "unknown") for point in scatter_points})
+    for source in feature_sources:
+        subset = [point for point in scatter_points if point[2].get("feature_source", "unknown") == source]
+        if not subset:
+            continue
+        xs = [point[0] for point in subset]
+        ys = [point[1] for point in subset]
+        colors = [point[2].get("mediator_layer", 0.0) for point in subset]
+        marker = FEATURE_SOURCE_MARKERS.get(source, "o")
+        scatter = plt.scatter(
+            xs,
+            ys,
+            c=colors,
+            cmap=cmap,
+            norm=layer_norm,
+            marker=marker,
+            alpha=0.85,
+            edgecolors="none",
+            label=source,
+        )
+        color_ref = color_ref or scatter
+
+    if color_ref:
+        cbar = plt.colorbar(color_ref)
+        cbar.set_label("Layer")
+
+    plt.xlabel("ΔNIE")
+    plt.ylabel("ΔPPL")
+    plt.title("单点替换：NIE vs ΔPPL")
+    handles, labels = plt.gca().get_legend_handles_labels()
+    if handles:
+        plt.legend(handles, labels)
+    plt.grid(True, alpha=0.3)
+    plot_path = os.path.splitext(csv_path)[0] + "_nie_scatter.png"
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"✓ 绘制 NIE-ΔPPL 散点图: {plot_path}")
 
 
 # ============================================================================
@@ -698,15 +903,15 @@ def plot_baseline_results(rows: List[Dict], csv_path: str) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="NIE Baselines (Head-off, Random Cut)")
     parser.add_argument("--model", type=str, default="gpt2")
-    parser.add_argument("--topk_json", type=str, default="/Users/qjzheng/Desktop/CMA-SFC-integration/experiments/data/topk_mediators_gpt2-small_doctor_woman_20251026_150239.json")
-    parser.add_argument("--eval_data", type=str, default="/Users/qjzheng/Desktop/CMA-SFC-integration/experiments/data/bias_eval_gpt2-small_doctor_woman_20251026_150239.json")
+    parser.add_argument("--ranking_csv", type=str, default="results/gpt2-small_nurse_man_20251109_173606.csv")
     parser.add_argument("--output", type=str, default="results/nie_baselines.csv")
+    parser.add_argument("--prompt_split", type=str, default="test", choices=["train", "val", "test", "all"])
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--controls", type=int, default=3)
     parser.add_argument("--num_features", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--corpus_path", type=str, default="test.txt", help="用于 ΔPPL 计算的评估语料（可为空）")
+    parser.add_argument("--corpus_path", type=str, default="data/WikiText‑2.txt", help="用于 PPL 评估的语料")
     parser.add_argument("--max_corpus_tokens", type=int, default=4096, help="语料最大 token 数（防止过大）")
     return parser.parse_args()
 
@@ -715,9 +920,9 @@ def main() -> None:
     args = parse_args()
     run_baselines(
         model_name=args.model,
-        mediator_path=args.topk_json,
-        eval_data_path=args.eval_data,
+        ranking_csv_path=args.ranking_csv,
         output_path=args.output,
+        prompt_split=args.prompt_split,
         topk=args.topk,
         control_count=args.controls,
         num_features=args.num_features,
