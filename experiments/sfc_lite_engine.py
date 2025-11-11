@@ -272,15 +272,18 @@ def make_layer_gate_hook(sae, feature_mask: np.ndarray, device: str):
     def gate_hook(y, hook):
         # y: [batch, pos, d_model]
         b, t, d = y.shape
-        y2 = y.reshape(-1, d).to(device)            # [B*T, d_model]
-        y2 = y2.float()                              # 避免 dtype 不匹配
+        y2 = y.reshape(-1, d).to(device)
+        y2 = y2.float()
 
         with torch.no_grad():
-            # 兼容获取 s 与 cache/info
-            s, cache = sae_encode_compat(sae, y2)   # s: [B*T, d_sae]
+            # encode → recon/residual → gate features → decode + residual
+            s, cache = sae_encode_compat(sae, y2)                 # [B*T, d_sae]
+            recon = sae_decode_compat(sae, s, cache)              # [B*T, d_model]
+            residual = y2 - recon                                 # preserve unmodeled part
             if feat_idx.numel() > 0:
-                s[:, feat_idx] = 0.0                # gate 选中特征
-            y_new = sae_decode_compat(sae, s, cache)  # [B*T, d_model]
+                s[:, feat_idx] = 0.0                              # hard gate
+            gated_recon = sae_decode_compat(sae, s, cache)        # [B*T, d_model]
+            y_new = gated_recon + residual                        # residual-preserving
             y_new = y_new.reshape(b, t, d)
 
         return y_new
@@ -300,6 +303,7 @@ def build_surgery(
     layers_limit: int,
     global_budget: int,
     device: str,
+    budget_mode: str = "global",
 ) -> Dict[int, Dict]:
     """
     Returns: plan dict
@@ -321,6 +325,12 @@ def build_surgery(
     layers = sorted(by_layer.keys())
     if layers_limit is not None:
         layers = layers[:layers_limit]
+
+    # Compute total selected heads (for head-mode per-head cap)
+    K_total = sum(len(set(by_layer[L])) for L in sorted(by_layer.keys()))
+    per_head_cap = None
+    if budget_mode == "head" and global_budget and global_budget > 0 and K_total > 0:
+        per_head_cap = max(0, int(global_budget // K_total))
 
     # Per-layer selection
     raw_masks: Dict[int, np.ndarray] = {}
@@ -347,10 +357,30 @@ def build_surgery(
             f"p95={quant[3]:.3f} p99={quant[4]:.3f}"
         )
 
-        # (4) Hybrid pick: Top-N per layer + tau_min
-        mask = pick_features_hybrid(
-            mass, heads_L, topn_per_layer=topn_per_layer, tau_min=tau_min
-        )
+        # (4) Selection
+        if budget_mode == "head":
+            # Per-head cap; union of top-k per head using mass[:, h]
+            n_features = mass.shape[0]
+            mask_bool = np.zeros(n_features, dtype=bool)
+            k_per_head = per_head_cap if per_head_cap is not None else topn_per_layer
+            if k_per_head is None or k_per_head <= 0:
+                k_per_head = 0
+            for h in heads_L:
+                scores = mass[:, h]
+                k = int(min(max(0, k_per_head), scores.shape[0]))
+                if k > 0:
+                    idx = torch.topk(scores, k=k, largest=True).indices
+                    idx_np = idx.detach().cpu().numpy()
+                    if tau_min is not None and tau_min > 0:
+                        keep_mask = scores[idx] >= tau_min
+                        idx_np = idx[keep_mask].detach().cpu().numpy()
+                    mask_bool[idx_np] = True
+            mask = mask_bool
+        else:
+            # Hybrid per-layer + later global fair cap
+            mask = pick_features_hybrid(
+                mass, heads_L, topn_per_layer=topn_per_layer, tau_min=tau_min
+            )
 
         raw_masks[L] = mask
         layer_info[L] = {
@@ -360,8 +390,8 @@ def build_surgery(
             "n_features_total": mass.shape[0],
         }
 
-    # (5) Global budget (optional): downsample per layer to meet total cap
-    if global_budget and global_budget > 0:
+    # (5) Global budget (optional): downsample per layer to meet total cap (only for global mode)
+    if budget_mode != "head" and global_budget and global_budget > 0:
         # Flatten all picked indices
         all_idx = []
         for L, m in raw_masks.items():
@@ -456,6 +486,7 @@ def main():
         layers_limit=args.layers_limit,
         global_budget=args.global_budget,
         device=args.device,
+        budget_mode="global",
     )
 
     for L, cfg in plan.items():

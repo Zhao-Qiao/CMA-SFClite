@@ -34,6 +34,8 @@ import torch.nn.functional as F
 import math
 from contextlib import nullcontext
 
+from .prompts_winogender import get_prompt_examples
+
 try:
     import plotly.express as px
     import plotly.graph_objects as go
@@ -57,34 +59,54 @@ from .cma_gender_bias import run_gender_bias_cma
 
 def parse_args():
     ap = argparse.ArgumentParser("Pareto sweep for SFC-lite (budget vs. bias improvement)")
-    ap.add_argument("--cma_csv", type=str, required=True,
+    ap.add_argument("--cma_csv", type=str, default="results/gpt2-small_nurse_man_20251110_173059.csv",
                     help="Path to CMA CSV with columns: rank/layer/head/nie/abs_nie.")
     ap.add_argument("--sae_release", type=str, default="gpt2-small-attn-out-v5-32k",
                     help="SAE-Lens release for attn_out (post-WO).")
-    ap.add_argument("--top_k_heads", type=int, default=10,
+    ap.add_argument("--top_k_heads", type=int, default=11,
                     help="Number of heads to take from CMA CSV.")
-    ap.add_argument("--topn_per_layer", type=int, default=1000,
+    ap.add_argument("--topn_per_layer", type=int, default=32000,
                     help="Top-N features per layer (pre-budget) sorted by attribution mass.")
-    ap.add_argument("--tau_min", type=float, default=0.05,
+    ap.add_argument("--tau_min", type=float, default=0.0,
                     help="Loose minimum mass floor.")
     ap.add_argument("--layers_limit", type=int, default=None,
                     help="Optional: restrict to the first N unique layers in CMA selection.")
 
-    ap.add_argument("--budgets", type=str, default="0,100,300,600,1200,2400,4800",
-                    help="Comma-separated global budgets to sweep; 0 disables cap.")
+    ap.add_argument(
+        "--budgets",
+        type=str,
+        default="0",
+        help="Budgets list or range 'start:end:step' (interpreted as per-head in head mode); 0 disables cap.",
+    )
 
     ap.add_argument("--prompt_base", type=str, default="The nurse said that",
                     help="Base prompt for bias measurement.")
     ap.add_argument("--prompt_cf", type=str, default="The man said that",
                     help="Counterfactual prompt for bias measurement.")
 
-    ap.add_argument("--ppl_file", type=str, default=None,
-                    help="Text file path for PPL computation (preferred).")
+    ap.add_argument(
+        "--ppl_file",
+        type=str,
+        default="data/WikiText.txt",
+        help="Text file path for PPL computation (preferred).",
+    )
+    ap.add_argument(
+        "--prompt_split",
+        type=str,
+        default="test",
+        choices=["train", "val", "test", "all"],
+        help="Prompt split for averaging TE/NIE across multiple base/cf pairs.",
+    )
     ap.add_argument("--ppl_text", type=str, default=None,
                     help="Fallback single string for PPL computation if no file is provided.")
 
-    ap.add_argument("--bias_axis", type=str, default="te", choices=["te", "nie"],
-                    help="Which bias metric to show on X axis (remaining % of baseline).")
+    ap.add_argument(
+        "--bias_axis",
+        type=str,
+        default="nie",
+        choices=["te", "nie"],
+        help="Which bias metric to show on X axis (remaining % of baseline).",
+    )
 
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                     help="Device to run on.")
@@ -166,13 +188,33 @@ def main():
     for (L, h, nie) in topk:
         print(f"  L{L:02d} H{h:02d}  NIE={nie:+.4f}")
 
-    # Baseline bias metrics (no surgery): TE and NIE
-    print("\nComputing baseline TE/NIE (no surgery)...")
-    bias_base_0 = pronoun_bias_score(model, args.prompt_base, device=args.device)
-    bias_cf_0   = pronoun_bias_score(model, args.prompt_cf,   device=args.device)
-    TE_0 = bias_cf_0 - bias_base_0
-    NIE_0 = compute_total_nie(model, args.prompt_base, args.prompt_cf)
-    print(f"  bias_base={bias_base_0:+.4f}  bias_cf={bias_cf_0:+.4f}  TE={TE_0:+.4f}  NIE={NIE_0:+.4f}")
+    # Load prompt pairs for averaging
+    examples = get_prompt_examples(args.prompt_split)
+    pairs = []
+    for ex in examples:
+        base = ex.get("base", ex.get("clean_prefix", ""))
+        cf = ex.get("counterfactual", ex.get("patch_prefix", ""))
+        if base and cf:
+            pairs.append((base, cf))
+    if not pairs:
+        # fallback to single pair from args
+        pairs = [(args.prompt_base, args.prompt_cf)]
+
+    # Baseline metrics averaged over prompt split
+    print("\nComputing baseline TE/NIE (no surgery) over prompt split...")
+    te_vals = []
+    nie_vals = []
+    for base, cf in pairs:
+        b0_i = pronoun_bias_score(model, base, device=args.device)
+        c0_i = pronoun_bias_score(model, cf,   device=args.device)
+        te_vals.append(c0_i - b0_i)
+        nie_vals.append(compute_total_nie(model, base, cf))
+    TE_0 = float(np.mean(te_vals)) if te_vals else float("nan")
+    NIE_0 = float(np.mean(nie_vals)) if nie_vals else float("nan")
+    # For logging, show first pair's biases
+    bias_base_0 = pronoun_bias_score(model, pairs[0][0], device=args.device)
+    bias_cf_0   = pronoun_bias_score(model, pairs[0][1], device=args.device)
+    print(f"  prompts={len(pairs)}  TE_mean={TE_0:+.4f}  NIE_mean={NIE_0:+.4f}")
 
     # PPL baseline on provided text
     ppl_text_all = read_text_for_ppl(args.ppl_file, args.ppl_text)
@@ -192,10 +234,20 @@ def main():
         t = t.strip()
         if not t:
             continue
-        try:
-            budgets.append(int(t))
-        except ValueError:
-            raise ValueError(f"Invalid budget value: '{t}'")
+        if ":" in t:
+            parts = t.split(":")
+            if len(parts) != 3:
+                raise ValueError(f"Invalid range budget token: '{t}' (expected start:end:step)")
+            start, end, step = map(int, parts)
+            if step <= 0:
+                raise ValueError("Range step must be > 0")
+            # inclusive end
+            budgets.extend(list(range(start, end + 1, step)))
+        else:
+            try:
+                budgets.append(int(t))
+            except ValueError:
+                raise ValueError(f"Invalid budget value: '{t}'")
 
     results: List[Dict] = []
     print("\nSweeping budgets...")
@@ -209,15 +261,21 @@ def main():
             tau_min=args.tau_min,
             layers_limit=args.layers_limit,
             global_budget=b,
+            budget_mode="head",
             device=args.device,
         )
         total_gated = count_total_gated(plan)
         print(f"    total gated features = {total_gated}")
 
-        # Apply surgery and measure TE
-        b1, c1 = run_with_surgery(model, plan, [args.prompt_base, args.prompt_cf], device=args.device)
-        TE_1 = c1 - b1
-        print(f"    AFTER: bias_base={b1:+.4f}  bias_cf={c1:+.4f}  TE={TE_1:+.4f}")
+        # Apply surgery and measure TE (averaged over prompts)
+        te_after_vals = []
+        for base, cf in pairs:
+            b1_i, c1_i = run_with_surgery(model, plan, [base, cf], device=args.device)
+            te_after_vals.append(c1_i - b1_i)
+        TE_1 = float(np.mean(te_after_vals)) if te_after_vals else float("nan")
+        # For logging, compute biases on first pair after surgery
+        b1_first, c1_first = run_with_surgery(model, plan, [pairs[0][0], pairs[0][1]], device=args.device)
+        print(f"    AFTER (mean TE over {len(pairs)} prompts) = {TE_1:+.4f}")
 
         # NIE under surgery (re-run CMA inside hooks)
         hooks = []
@@ -225,13 +283,13 @@ def main():
             hook_fn = make_layer_gate_hook(cfg["sae"], cfg["mask"], device=args.device)
             hooks.append((cfg["hook_name"], hook_fn))
         with model.hooks(fwd_hooks=hooks):
-            NIE_1 = compute_total_nie(model, args.prompt_base, args.prompt_cf)
-        print(f"    NIE_after={NIE_1:+.4f}")
+            nie_after_vals = []
+            for base, cf in pairs:
+                nie_after_vals.append(compute_total_nie(model, base, cf))
+        NIE_1 = float(np.mean(nie_after_vals)) if nie_after_vals else float("nan")
 
-        # Remaining bias (% of baseline)
-        eps = 1e-9
-        remaining_te_pct = (abs(TE_1) / max(abs(TE_0), eps)) * 100.0
-        remaining_nie_pct = (abs(NIE_1) / max(abs(NIE_0), eps)) * 100.0
+        # Baseline-aligned metric: Δ|NIE| = |NIE_after| - |NIE_before|
+        delta_nie = abs(NIE_1) - abs(NIE_0)
 
         # PPL after (and ΔPPL)
         ppl_1 = None
@@ -250,19 +308,18 @@ def main():
             "bias_cf_before": bias_cf_0,
             "TE_before": TE_0,
             "NIE_before": NIE_0,
-            "bias_base_after": b1,
-            "bias_cf_after": c1,
+            "bias_base_after": b1_first,
+            "bias_cf_after": c1_first,
             "TE_after": TE_1,
             "NIE_after": NIE_1,
-            "remaining_te_pct": remaining_te_pct,
-            "remaining_nie_pct": remaining_nie_pct,
+            "delta_nie": delta_nie,
             "PPL_before": ppl_0,
             "PPL_after": ppl_1,
             "delta_ppl": delta_ppl,
         })
 
-    # Mark Pareto frontier
-    x_key = "remaining_te_pct" if args.bias_axis == "te" else "remaining_nie_pct"
+    # Mark Pareto frontier (X = Δ|NIE|, Y = ΔPPL)
+    x_key = "delta_nie"
     y_key = "delta_ppl"
     pareto_flags = compute_pareto_frontier(results, x_key=x_key, y_key=y_key)
     for rec, flag in zip(results, pareto_flags):
@@ -286,7 +343,7 @@ def main():
         y=y_key,
         color="total_gated",
         hover_data=["budget", "TE_before", "TE_after", "NIE_before", "NIE_after", "PPL_before", "PPL_after"],
-        title=f"SFC-lite Bias–Perplexity Pareto (X={x_key}, Y={y_key})",
+        title=f"SFC-lite Bias–Perplexity Pareto (X=Δ|NIE|, Y=ΔPPL)",
         template="simple_white",
     )
     # Overlay Pareto frontier line
