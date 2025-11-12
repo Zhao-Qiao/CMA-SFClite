@@ -304,6 +304,7 @@ def build_surgery(
     global_budget: int,
     device: str,
     budget_mode: str = "global",
+    verbose: bool = False,
 ) -> Dict[int, Dict]:
     """
     Returns: plan dict
@@ -329,7 +330,7 @@ def build_surgery(
     # Compute total selected heads (for head-mode per-head cap)
     K_total = sum(len(set(by_layer[L])) for L in sorted(by_layer.keys()))
     per_head_cap = None
-    if budget_mode == "head" and global_budget and global_budget > 0 and K_total > 0:
+    if budget_mode == "head" and K_total > 0 and (global_budget is not None):
         per_head_cap = max(0, int(global_budget // K_total))
 
     # Per-layer selection
@@ -349,13 +350,14 @@ def build_surgery(
 
         # (3.1) Diagnostics: print a few quantiles to guide tau_min/topN
         sel_mass = mass[:, heads_L].sum(dim=1)
-        qs = torch.tensor([0.5, 0.8, 0.9, 0.95, 0.99], device=sel_mass.device)
-        quant = torch.quantile(sel_mass, qs)
-        print(
-            f"Layer {L} attribution mass over heads {heads_L} :: "
-            f"median={quant[0]:.3f} p80={quant[1]:.3f} p90={quant[2]:.3f} "
-            f"p95={quant[3]:.3f} p99={quant[4]:.3f}"
-        )
+        if verbose:
+            qs = torch.tensor([0.5, 0.8, 0.9, 0.95, 0.99], device=sel_mass.device)
+            quant = torch.quantile(sel_mass, qs)
+            print(
+                f"Layer {L} attribution mass over heads {heads_L} :: "
+                f"median={quant[0]:.3f} p80={quant[1]:.3f} p90={quant[2]:.3f} "
+                f"p95={quant[3]:.3f} p99={quant[4]:.3f}"
+            )
 
         # (4) Selection
         if budget_mode == "head":
@@ -487,6 +489,7 @@ def main():
         global_budget=args.global_budget,
         device=args.device,
         budget_mode="global",
+        verbose=True,
     )
 
     for L, cfg in plan.items():

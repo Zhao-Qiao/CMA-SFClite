@@ -21,9 +21,10 @@ import numpy as np
 import torch
 from sae_lens import SAE
 from transformer_lens import HookedTransformer
+from .cma_gender_bias import run_gender_bias_cma
 from tqdm import tqdm
 
-from prompts_winogender import get_prompt_examples
+from .prompts_winogender import get_prompt_examples
 
 
 # ============================================================================
@@ -794,7 +795,8 @@ def _multi_layer_hooks(
         recon = dictionary.decode(features)
         residual = activation - recon
         node = nodes[sub]
-        target_mask = (~node.act).to(torch.bool)
+        # ensure mask on same device as features
+        target_mask = (~node.act).to(torch.bool).to(features.device)
         feat_scaled = features.clone()
         if target_mask.numel() == feat_scaled.numel():
             feat_scaled = feat_scaled * alpha
@@ -850,6 +852,7 @@ def apply_multi_layer_alpha_gate(
     ppl_gated = _perplexity_from_logits(logits_gated[0], tokens_base_1d)
     nie = bias_cf_replaced - bias_clean
     return bias_clean, bias_gated, ppl_clean, ppl_gated, nie
+
 def run_baselines(
     model_name: str,
     ranking_csv_path: str,
@@ -863,6 +866,7 @@ def run_baselines(
     device: str,
     corpus_path: Optional[str],
     max_corpus_tokens: Optional[int],
+    nie_mode: str,
 ) -> str:
     if SAE_MODE not in {"resid", "attn"}:
         raise ValueError("SAE_MODE must be 'resid' or 'attn'")
@@ -897,6 +901,9 @@ def run_baselines(
 
     mediators = load_ranked_mediators_from_csv(ranking_csv_path, topk if topk > 0 else None)
     topk_mediators = mediators[:topk]
+    include_map: Dict[int, List[int]] = {}
+    for m in topk_mediators:
+        include_map.setdefault(int(m["layer"]), []).append(int(m.get("head")))
 
     examples = get_prompt_examples(prompt_split)
     if not examples:
@@ -964,7 +971,7 @@ def run_baselines(
                 feats = rng.choice(dict_size, size=k, replace=False).tolist() if k > 0 else []
                 layer_to_indices[sub.layer] = feats
             # 基线：仅替换“同一特征集合”，alpha=1.0 → |NIE_before|
-            _, _, ppl_clean_ex, _, nie_before = apply_multi_layer_alpha_gate(
+            bias_base, _, ppl_base, _, nie_base_local = apply_multi_layer_alpha_gate(
                 model=model,
                 submodules=submodules,
                 dictionaries=dictionaries,
@@ -973,8 +980,17 @@ def run_baselines(
                 layer_to_indices=layer_to_indices,
                 alpha=1.0,
             )
+            # NIE_before by mode
+            if nie_mode == "local":
+                nie_before = nie_base_local
+            elif nie_mode == "heads":
+                effects = run_gender_bias_cma(model, base_prompt, cf_prompt, verbose=False, include_heads_by_layer=include_map)
+                nie_before = float(sum(sum(row) for row in effects))
+            else:
+                effects = run_gender_bias_cma(model, base_prompt, cf_prompt, verbose=False)
+                nie_before = float(sum(sum(row) for row in effects))
             # 干预：同集合，alpha=0.0 → |NIE_after|
-            bias_clean_ex, bias_edit_ex, ppl_clean2, ppl_edit_ex, nie_after = apply_multi_layer_alpha_gate(
+            bias_clean_ex, bias_edit_ex, ppl_clean2, ppl_edit_ex, _nie_after_local = apply_multi_layer_alpha_gate(
                 model=model,
                 submodules=submodules,
                 dictionaries=dictionaries,
@@ -983,10 +999,27 @@ def run_baselines(
                 layer_to_indices=layer_to_indices,
                 alpha=scenario["alpha"],
             )
+            # NIE_after by mode（在相同多层 edit hooks 下评估）
+            if nie_mode == "local":
+                nie_after = _nie_after_local
+            else:
+                hooks_eval: List[Tuple[str, callable]] = []
+                for sub in submodules:
+                    dictionary = dictionaries[sub]
+                    feats = layer_to_indices.get(sub.layer, [])
+                    hook_fn = make_scaling_hook(dictionary, feats, 0.0)
+                    hooks_eval.append((sub.hook_name, hook_fn))
+                with model.hooks(fwd_hooks=hooks_eval):
+                    if nie_mode == "heads":
+                        eff = run_gender_bias_cma(model, base_prompt, cf_prompt, verbose=False, include_heads_by_layer=include_map)
+                    else:
+                        eff = run_gender_bias_cma(model, base_prompt, cf_prompt, verbose=False)
+                    nie_after = float(sum(sum(row) for row in eff))
             bias_clean_vals.append(bias_clean_ex)
             bias_edit_vals.append(bias_edit_ex)
             ppl_clean_vals.append(ppl_clean2)
             ppl_edit_vals.append(ppl_edit_ex)
+            # Δ|NIE| = |NIE_after| - |NIE_before|
             nie_vals.append(abs(nie_after) - abs(nie_before))
 
         if not bias_clean_vals:
@@ -1062,6 +1095,38 @@ def plot_baseline_results(rows: List[Dict], csv_path: str) -> None:
         return
     plot_bias_vs_ppl(aggregate_rows, csv_path)
     plot_nie_vs_ppl(aggregate_rows, csv_path)
+    # Plotly HTML exports (optional)
+    try:
+        import pandas as pd
+        import plotly.express as px
+        base_path = os.path.splitext(csv_path)[0]
+        # Build DataFrame
+        def _y(row: Dict) -> float:
+            val = row.get("delta_corpus_ppl")
+            if val is None or (isinstance(val, float) and (val != val)):
+                val = row.get("delta_ppl_mean")
+            return val
+        df = pd.DataFrame({
+            "delta_nie": [r.get("delta_nie_mean") for r in aggregate_rows],
+            "remaining_nie_pct": [r.get("remaining_bias_pct", float("nan")) * 100 for r in aggregate_rows],
+            "delta_ppl": [_y(r) for r in aggregate_rows],
+            "feature_count": [r.get("feature_count") for r in aggregate_rows],
+            "edit_label": [r.get("edit_label") for r in aggregate_rows],
+        })
+        # Δ|NIE| vs ΔPPL
+        fig1 = px.scatter(df, x="delta_nie", y="delta_ppl", color="feature_count", hover_data=["edit_label"],
+                          title="Δ|NIE| vs ΔPPL (baseline)", template="simple_white")
+        html1 = f"{base_path}_nie_scatter.html"
+        fig1.write_html(html1)
+        print(f"✓ 绘制 NIE-ΔPPL 交互图: {html1}")
+        # Bias–PPL
+        fig2 = px.scatter(df, x="remaining_nie_pct", y="delta_ppl", color="feature_count", hover_data=["edit_label"],
+                          title="Bias–PPL (Remaining NIE% vs ΔPPL)", template="simple_white")
+        html2 = f"{base_path}_bias_ppl.html"
+        fig2.write_html(html2)
+        print(f"✓ 绘制 Bias–PPL 交互图: {html2}")
+    except Exception:
+        pass
 
 
 FEATURE_SOURCE_MARKERS = {
@@ -1239,7 +1304,8 @@ def parse_args() -> argparse.Namespace:
                                                                             3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 
                                                                             20000, 21000, 22000, 23000, 24000, 25000, 26000, 27000, 28000, 29000, 30000, 31000, 32000
                                                                             ], help="多档 num_features（每头裁剪的维度数），例如: --num_features_list 100 200 300")
-    parser.add_argument("--num_features_range", type=int, nargs=3, default=[0, 32000, 100], help="以范围生成多档 num_features：start end step（含端点）")
+    parser.add_argument("--num_features_range", type=int, nargs=3, default=[0, 32000, 1000], help="以范围生成多档 num_features：start end step（含端点）")
+    parser.add_argument("--nie_mode", type=str, default="heads", choices=["local", "heads", "full"], help="NIE 模式：local=单次替换；heads=仅选中头的 CMA；full=全 CMA")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--corpus_path", type=str, default="data/WikiText.txt", help="用于 PPL 评估的语料")
@@ -1262,6 +1328,7 @@ def main() -> None:
         device=args.device,
         corpus_path=args.corpus_path,
         max_corpus_tokens=args.max_corpus_tokens,
+        nie_mode=args.nie_mode,
     )
 
 

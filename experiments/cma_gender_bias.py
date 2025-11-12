@@ -42,7 +42,7 @@ pip install transformer_lens plotly
 from __future__ import annotations
 
 import argparse
-from typing import List
+from typing import List, Optional, Dict
 import time
 import os
 import csv
@@ -95,6 +95,8 @@ def run_gender_bias_cma(
     model: HookedTransformer,
     base_prompt: str,
     cf_prompt: str,
+    verbose: bool = False,
+    include_heads_by_layer: Optional[Dict[int, List[int]]] = None,
 ) -> List[List[float]]:
     """
     运行性别偏见的因果中介分析（逐头，中介=pre-Wo 的 z；对应 TL: blocks.L.attn.hook_z）
@@ -106,15 +108,19 @@ def run_gender_bias_cma(
     num_layers = model.cfg.n_layers
     num_heads = model.cfg.n_heads
 
-    print(f"\n{'='*70}")
-    print(f"逐头中介替换（TransformerLens; hook: blocks.L.attn.hook_z, pre-Wo）")
-    print(f"{'='*70}")
-    print(f"base:          '{base_prompt}'")
-    print(f"counterfactual: '{cf_prompt}'")
-    print(f"度量固定:      bias = logit(she) - logit(he)")
-    print(f"               （she/he 不在 prompt，都是预测候选）")
-    print(f"\n扫描范围: {num_layers} 层 × {num_heads} 头 = {num_layers * num_heads} 次干预")
-    print(f"{'='*70}\n")
+    def vlog(msg: str, **kwargs):
+        if verbose:
+            print(msg, **kwargs)
+
+    vlog(f"\n{'='*70}")
+    vlog(f"逐头中介替换（TransformerLens; hook: blocks.L.attn.hook_z, pre-Wo）")
+    vlog(f"{'='*70}")
+    vlog(f"base:          '{base_prompt}'")
+    vlog(f"counterfactual: '{cf_prompt}'")
+    vlog(f"度量固定:      bias = logit(she) - logit(he)")
+    vlog(f"               （she/he 不在 prompt，都是预测候选）")
+    vlog(f"\n扫描范围: {num_layers} 层 × {num_heads} 头 = {num_layers * num_heads} 次干预")
+    vlog(f"{'='*70}\n")
 
     # 预先 token 化并移动到模型设备
     device = next(model.parameters()).device
@@ -126,7 +132,7 @@ def run_gender_bias_cma(
 
     for layer_idx in range(num_layers):
         layer_start = time.time()
-        print(f"  [Layer {layer_idx:2d}/{num_layers-1}] ", end="", flush=True)
+        vlog(f"  [Layer {layer_idx:2d}/{num_layers-1}] ", end="", flush=True)
         per_layer: List[float] = []
 
         # 先取 cf 的该层 z（所有头），只需前向一次
@@ -141,8 +147,16 @@ def run_gender_bias_cma(
             logits_base = model(toks_base, return_type="logits")[0]  # (seq, d_vocab)
         bias_clean = _bias_from_logits(logits_base[-1, :], id_she, id_he)
 
+        # determine which heads to compute
+        allowed_heads: Optional[List[int]] = None
+        if include_heads_by_layer is not None:
+            allowed_heads = include_heads_by_layer.get(layer_idx)
         for head_idx in range(num_heads):
             with torch.no_grad():
+                if allowed_heads is not None and head_idx not in allowed_heads:
+                    # skip computation, keep placeholder 0
+                    per_layer.append(0.0)
+                    continue
                 # 取该 head 的 cf 中介激活（pre-Wo）
                 z_cf_head = z_cf_lastpos[head_idx].detach().clone()  # (d_head,)
 
@@ -154,12 +168,11 @@ def run_gender_bias_cma(
                     return out
 
                 # 在 base prompt 上应用干预 → logits_int
-                with torch.no_grad():
-                    logits_int = model.run_with_hooks(
-                        toks_base,
-                        fwd_hooks=[(f"blocks.{layer_idx}.attn.hook_z", patch_z)],
-                        return_type="logits"
-                    )[0]
+                logits_int = model.run_with_hooks(
+                    toks_base,
+                    fwd_hooks=[(f"blocks.{layer_idx}.attn.hook_z", patch_z)],
+                    return_type="logits"
+                )[0]
                 bias_int = _bias_from_logits(logits_int[-1, :], id_she, id_he)
 
                 # NIE（该头的间接效应）
@@ -168,12 +181,12 @@ def run_gender_bias_cma(
 
         causal_effects.append(per_layer)
         layer_time = time.time() - layer_start
-        print(f"✓ ({layer_time:.1f}s)")
+        vlog(f"✓ ({layer_time:.1f}s)")
 
     total_time = time.time() - start_time
-    print(f"\n{'='*70}")
-    print(f"✓ 完成！总耗时: {total_time:.1f} 秒 ({total_time/60:.2f} 分钟)")
-    print(f"{'='*70}\n")
+    vlog(f"\n{'='*70}")
+    vlog(f"✓ 完成！总耗时: {total_time:.1f} 秒 ({total_time/60:.2f} 分钟)")
+    vlog(f"{'='*70}\n")
 
     return causal_effects
 
@@ -314,7 +327,7 @@ def analyze_top_heads(
     if negative_heads:
         for i, (layer, head, effect) in enumerate(negative_heads[:top_k], 1):
             print(f"  #{i}: Layer {layer:2d}, Head {head:2d}  |  NIE = {effect:.5f}")
-        print(f"\n  解释：这些头从 source 转移后降低了代词概率，可能具有去偏见的作用")
+        print(f"\n  解释：这些头从 source 转移后降低了代词概率，可能具有去偏作用")
     else:
         print("  无负向影响头")
     print("="*70)
