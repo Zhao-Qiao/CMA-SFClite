@@ -288,8 +288,10 @@ def main():
                 nie_after_vals.append(compute_total_nie(model, base, cf))
         NIE_1 = float(np.mean(nie_after_vals)) if nie_after_vals else float("nan")
 
-        # Baseline-aligned metric: Δ|NIE| = |NIE_after| - |NIE_before|
+        # Baseline-aligned metric: Δ|NIE|，以及“剩余 NIE%”用于 Bias–PPL 图
         delta_nie = abs(NIE_1) - abs(NIE_0)
+        eps = 1e-9
+        remaining_nie_pct = (abs(NIE_1) / max(abs(NIE_0), eps)) * 100.0
 
         # PPL after (and ΔPPL)
         ppl_1 = None
@@ -313,6 +315,7 @@ def main():
             "TE_after": TE_1,
             "NIE_after": NIE_1,
             "delta_nie": delta_nie,
+            "remaining_nie_pct": remaining_nie_pct,
             "PPL_before": ppl_0,
             "PPL_after": ppl_1,
             "delta_ppl": delta_ppl,
@@ -360,6 +363,32 @@ def main():
     html_path = os.path.join(args.out_dir, f"pareto_{ts}.html")
     fig.write_html(html_path)
     print(f"Saved Pareto plot (HTML) → {html_path}")
+
+    # Second plot: Bias–PPL Pareto (remaining NIE% vs ΔPPL)
+    if "remaining_nie_pct" in df.columns:
+        df2 = df.copy()
+        fig2 = px.scatter(
+            df2,
+            x="remaining_nie_pct",
+            y="delta_ppl",
+            color="total_gated",
+            hover_data=["budget", "NIE_before", "NIE_after", "PPL_before", "PPL_after"],
+            title="Bias–PPL Pareto (X=remaining NIE %, Y=ΔPPL)",
+            template="simple_white",
+        )
+        df2_front = df2[df2["is_pareto"]].sort_values(by="remaining_nie_pct")
+        if not df2_front.empty:
+            fig2.add_trace(go.Scatter(
+                x=df2_front["remaining_nie_pct"],
+                y=df2_front["delta_ppl"],
+                mode="lines+markers",
+                name="Pareto frontier",
+                line=dict(color="black", width=2),
+                marker=dict(symbol="diamond", size=8),
+            ))
+        html_path2 = os.path.join(args.out_dir, f"pareto_bias_{ts}.html")
+        fig2.write_html(html_path2)
+        print(f"Saved Bias–PPL Pareto (HTML) → {html_path2}")
 
 
 if __name__ == "__main__":
